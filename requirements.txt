@@ -1,0 +1,9 @@
+# MQTT pyhon客户端
+paho-mqtt
+
+# Modbus 通信
+pymodbus
+pyserial
+
+# 配置文件处理
+pyyaml
