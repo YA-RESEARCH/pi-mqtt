@@ -88,7 +88,7 @@ class SensorMqttManager:
                         topic = f"{self.config['mqtt']['data_topic_prefix']}/{sensor_id}"
                         self.mqtt_client.publish(topic, json.dumps(data))
                         logging.debug(f"发布数据到 {topic}: {data}")
-            time.sleep(self.config.get('polling_interval', 2))
+            time.sleep(self.config.get('polling_interval', 0.1))
 
     def _read_sensor(self, sensor_id, config):
         """读取单个传感器数据"""
@@ -145,7 +145,7 @@ class SensorMqttManager:
         """运行管理器"""
         self._setup_mqtt()
         # 默认启动时开始轮询，也可以通过 MQTT 命令控制
-        self.start_polling()
+        # self.start_polling()
         try:
             while True:
                 time.sleep(1)

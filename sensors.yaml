@@ -2,8 +2,8 @@ mqtt:
   broker: "172.16.20.4"
   port: 1883
   client_id: "pi-sensor-monitor"
-  data_topic_prefix: "sensors/data"
-  control_topic: "sensors/control"
+  data_topic_prefix: "CO2Weld_K3/workstation/1/sensors/data"
+  control_topic: "CO2Weld_K3/workstation/1/sensors/control"
 
 serial:
   port: /dev/ttyUSB0
