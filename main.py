@@ -18,12 +18,28 @@ class SensorMqttManager:
         self.is_running = False
         self.polling_thread = None
         self.lock = threading.Lock()
+        self._classify_sensors()
 
     def _load_config(self, config_path):
         """加载 YAML 配置文件"""
         with open(config_path, 'r', encoding='utf-8') as f:
             self.config = yaml.safe_load(f)
         logging.info("配置加载成功")
+    
+    def _classify_sensors(self):
+        """根据配置分类传感器（可读/可写）"""
+        self.readable_sensors = {}
+        self.writable_sensors = {}
+        
+        for sensor_id, config in self.config['sensors'].items():
+            if 'read' in config:
+                self.readable_sensors[sensor_id] = config
+                logging.info(f"传感器 {sensor_id} 支持读取")
+            if 'write' in config:
+                self.writable_sensors[sensor_id] = config
+                logging.info(f"传感器 {sensor_id} 支持写入")
+        
+        logging.info(f"共 {len(self.readable_sensors)} 个可读传感器, {len(self.writable_sensors)} 个可写传感器")
 
     def _connect_modbus(self):
         """连接 Modbus"""
@@ -58,19 +74,37 @@ class SensorMqttManager:
         """MQTT 连接回调"""
         if rc == 0:
             control_topic = self.config['mqtt']['control_topic']
-            logging.info(f"成功连接到 MQTT Broker，订阅控制主题: {control_topic}")
+            write_topic = self.config['mqtt']['write_topic']
+            logging.info(f"成功连接到 MQTT Broker")
             client.subscribe(control_topic)
+            client.subscribe(write_topic)
+            logging.info(f"已订阅控制主题: {control_topic}")
+            logging.info(f"已订阅写入主题: {write_topic}")
         else:
             logging.error(f"MQTT 连接失败，返回码: {rc}")
 
     def _on_message(self, client, userdata, msg):
-        """MQTT 消息回调，处理控制命令"""
-        command = msg.payload.decode()
-        logging.info(f"收到控制命令: {command} on topic {msg.topic}")
-        if command == "start":
-            self.start_polling()
-        elif command == "stop":
-            self.stop_polling()
+        """MQTT 消息回调，处理控制命令和写入命令"""
+        topic = msg.topic
+        control_topic = self.config['mqtt']['control_topic']
+        write_topic = self.config['mqtt']['write_topic']
+        
+        if topic == control_topic:
+            # 处理控制命令
+            command = msg.payload.decode()
+            logging.info(f"收到控制命令: {command}")
+            if command == "start":
+                self.start_polling()
+            elif command == "stop":
+                self.stop_polling()
+        elif topic == write_topic:
+            # 处理写入命令
+            try:
+                payload = json.loads(msg.payload.decode())
+                logging.info(f"收到写入命令: {payload}")
+                self._handle_write_command(payload)
+            except json.JSONDecodeError as e:
+                logging.error(f"写入命令 JSON 解析失败: {e}")
 
     def _poll_sensors(self):
         """轮询传感器并发布数据"""
@@ -82,27 +116,29 @@ class SensorMqttManager:
                         time.sleep(5) # 重连失败，等待后重试
                         continue
                 
-                for sensor_id, config in self.config['sensors'].items():
+                # 只轮询可读传感器
+                for sensor_id, config in self.readable_sensors.items():
                     data = self._read_sensor(sensor_id, config)
                     if data:
-                        topic = f"{self.config['mqtt']['data_topic_prefix']}/{sensor_id}"
+                        topic = f"{self.config['mqtt']['read_topic']}/{sensor_id}"
                         self.mqtt_client.publish(topic, json.dumps(data))
                         logging.debug(f"发布数据到 {topic}: {data}")
-            time.sleep(self.config.get('polling_interval', 2))
+            time.sleep(self.config.get('polling_interval', 0.1))
 
     def _read_sensor(self, sensor_id, config):
         """读取单个传感器数据"""
         try:
+            read_config = config['read']
             res = self.modbus_client.read_holding_registers(
-                address=config['address'],
-                count=config['count'],
+                address=read_config['address'],
+                count=read_config['count'],
                 device_id=config['device_id']
             )
             if res.isError() or not res.registers:
                 logging.warning(f"读取传感器 {sensor_id} 失败")
                 return None
             
-            parser = getattr(self, f"_parse_{config['parser']}_data", lambda r: {})
+            parser = getattr(self, f"_parse_{read_config['parser']}_data", lambda r: {})
             return parser(res.registers)
         except Exception as e:
             logging.error(f"读取传感器 {sensor_id} 异常: {e}")
@@ -123,6 +159,126 @@ class SensorMqttManager:
         humidity = round(registers[1] / 10.0, 1)
         smoke = registers[2]
         return {"temperature": temperature, "humidity": humidity, "smoke": smoke}
+    
+    def _handle_write_command(self, payload):
+        """处理写入命令
+        
+        消息格式: 
+        {
+            "sensor_id": "voltage_current_output",
+            "data": {
+                "voltage": 220.5,
+                "current": 15.3
+            }
+        }
+        """
+        try:
+            sensor_id = payload.get('sensor_id')
+            data = payload.get('data')
+            
+            if not sensor_id or not data:
+                logging.error("写入命令格式错误：缺少 sensor_id 或 data")
+                return
+            
+            if sensor_id not in self.writable_sensors:
+                logging.error(f"传感器 {sensor_id} 不支持写入")
+                return
+            
+            success = self._write_sensor(sensor_id, data)
+            if success:
+                logging.info(f"成功写入传感器 {sensor_id}: {data}")
+            else:
+                logging.error(f"写入传感器 {sensor_id} 失败")
+        except Exception as e:
+            logging.error(f"处理写入命令异常: {e}")
+    
+    def _write_sensor(self, sensor_id, data):
+        """写入单个传感器数据"""
+        with self.lock:
+            try:
+                if not self.modbus_client or not self.modbus_client.is_socket_open():
+                    logging.warning("Modbus 未连接，尝试重连...")
+                    if not self._connect_modbus():
+                        return False
+                
+                config = self.writable_sensors[sensor_id]
+                write_config = config['write']
+                
+                # 根据 parser 类型转换数据为寄存器值
+                parser_name = write_config['parser']
+                encoder = getattr(self, f"_encode_{parser_name}_data", None)
+                if not encoder:
+                    logging.error(f"未找到编码器: _encode_{parser_name}_data")
+                    return False
+                
+                registers = encoder(data)
+                if not registers:
+                    logging.error(f"数据编码失败: {data}")
+                    return False
+                
+                # 写入寄存器
+                res = self.modbus_client.write_registers(
+                    address=write_config['address'],
+                    values=registers,
+                    device_id=config['device_id']
+                )
+                
+                if res.isError():
+                    logging.error(f"写入 Modbus 寄存器失败: {res}")
+                    return False
+                
+                return True
+            except Exception as e:
+                logging.error(f"写入传感器 {sensor_id} 异常: {e}")
+                if self.modbus_client and self.modbus_client.is_socket_open():
+                    self.modbus_client.close()
+                return False
+    
+    def _encode_analog_output_data(self, data):
+        """编码模拟量输出数据为寄存器值
+        
+        根据文档: 16位无符号整形值，单位为微安(uA)
+        
+        电压表和电流表都通过4-20mA信号来模拟显示:
+        
+        电压表映射关系 (0-12V):
+        - 显示值 0V  → 4mA  (4000 µA)
+        - 显示值 12V → 20mA (20000 µA)
+        - 公式: 实际电流(µA) = 4000 + (显示值 / 12) * 16000
+        
+        电流表映射关系 (0-200A):
+        - 显示值 0A   → 4mA  (4000 µA)
+        - 显示值 200A → 20mA (20000 µA)
+        - 公式: 实际电流(µA) = 4000 + (显示值 / 200) * 16000
+        
+        输入格式: {"voltage": 10.5, "current": 150}  
+        - voltage: 电压表显示值(0-12V)，会映射到4-20mA
+        - current: 电流表显示值(0-200A)，会映射到4-20mA
+        输出: [18000, 16000]  # [电压通道(µA), 电流通道(µA)]
+        """
+        try:
+            voltage_display = data.get('voltage', 0)  # 电压表显示值 0-12
+            current_display = data.get('current', 0)  # 电流表显示值 0-200
+            
+            # 电压: 显示值(0-12) -> 4-20mA (4000-20000 µA)
+            # 线性映射公式: y = 4000 + (x / 12) * 16000
+            voltage_reg = int(4000 + (voltage_display / 12.0) * 16000)
+            
+            # 电流: 显示值(0-200) -> 4-20mA (4000-20000 µA)
+            # 线性映射公式: y = 4000 + (x / 200) * 16000
+            current_reg = int(4000 + (current_display / 200.0) * 16000)
+
+            # 确保在4-20mA范围内
+            voltage_reg = max(4000, min(20000, voltage_reg))
+            current_reg = max(4000, min(20000, current_reg))
+            
+            registers = [voltage_reg, current_reg]
+            
+            logging.info(f"编码模拟量输出: voltage={voltage_display}V→{voltage_reg}µA, current={current_display}A→{current_reg}µA, registers={registers}")
+            return registers
+        except Exception as e:
+            logging.error(f"编码模拟量输出数据失败: {e}")
+            return None
 
     def start_polling(self):
         """启动轮询线程"""
@@ -145,7 +301,7 @@ class SensorMqttManager:
         """运行管理器"""
         self._setup_mqtt()
         # 默认启动时开始轮询，也可以通过 MQTT 命令控制
-        self.start_polling()
+        # self.start_polling()
         try:
             while True:
                 time.sleep(1)
