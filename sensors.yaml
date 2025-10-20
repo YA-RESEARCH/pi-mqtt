@@ -2,7 +2,8 @@ mqtt:
   broker: "172.16.20.4"
   port: 1883
   client_id: "pi-sensor-monitor"
-  data_topic_prefix: "CO2Weld_K3/workstation/1/sensors/data"
+  read_topic: "CO2Weld_K3/workstation/1/sensors/read"
+  write_topic: "CO2Weld_K3/workstation/1/sensors/write"
   control_topic: "CO2Weld_K3/workstation/1/sensors/control"
 
 serial:
@@ -16,11 +17,21 @@ serial:
 sensors:
   angle_sensor_1:
     device_id: 80
-    address: 61
-    count: 2
-    parser: "angle"
+    read:
+      address: 61
+      count: 2
+      parser: "angle"
+    
   env_sensor_1:
     device_id: 81
-    address: 0
-    count: 3
-    parser: "environmental"
+    read:
+      address: 0
+      count: 3
+      parser: "environmental"
+      
+  voltage_current_output:
+    device_id: 1
+    write:
+      address: 0x0056  # 第7路模拟量输出起始地址
+      count: 2         # 2路输出：第1路电压，第2路电流
+      parser: "analog_output"
