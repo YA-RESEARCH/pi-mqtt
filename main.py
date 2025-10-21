@@ -18,6 +18,13 @@ class SensorMqttManager:
         self.is_running = False
         self.polling_thread = None
         self.lock = threading.Lock()
+        
+        # 按变化发布机制的状态变量
+        self.last_sensor_data = {}      # 缓存上次读取的数据
+        self.last_publish_time = {}     # 缓存上次发布的时间戳
+        self.force_publish_interval = self.config.get('force_publish_interval', 60)  # 强制发布间隔(秒)，默认60秒
+        self.change_threshold = self.config.get('change_threshold', 0.1)  # 数值变化阈值，默认0.1
+        
         self._classify_sensors()
 
     def _load_config(self, config_path):
@@ -40,6 +47,7 @@ class SensorMqttManager:
                 logging.info(f"传感器 {sensor_id} 支持写入")
         
         logging.info(f"共 {len(self.readable_sensors)} 个可读传感器, {len(self.writable_sensors)} 个可写传感器")
+        logging.info(f"发布策略: 变化阈值={self.change_threshold}, 强制发布间隔={self.force_publish_interval}秒")
 
     def _connect_modbus(self):
         """连接 Modbus"""
@@ -107,7 +115,7 @@ class SensorMqttManager:
                 logging.error(f"写入命令 JSON 解析失败: {e}")
 
     def _poll_sensors(self):
-        """轮询传感器并发布数据"""
+        """轮询传感器并发布数据（按变化发布 + 定时心跳）"""
         while self.is_running:
             with self.lock:
                 if not self.modbus_client or not self.modbus_client.is_socket_open():
@@ -120,10 +128,29 @@ class SensorMqttManager:
                 for sensor_id, config in self.readable_sensors.items():
                     data = self._read_sensor(sensor_id, config)
                     if data:
-                        topic = f"{self.config['mqtt']['read_topic']}/{sensor_id}"
-                        self.mqtt_client.publish(topic, json.dumps(data))
-                        logging.debug(f"发布数据到 {topic}: {data}")
-            time.sleep(self.config.get('polling_interval', 0.1))
+                        # 检查数据是否变化和是否需要强制发布
+                        data_changed = self._data_changed(sensor_id, data)
+                        force_publish = self._should_force_publish(sensor_id)
+                        
+                        should_publish = data_changed or force_publish
+                        
+                        if should_publish:
+                            topic = f"{self.config['mqtt']['read_topic']}/{sensor_id}"
+                            self.mqtt_client.publish(topic, json.dumps(data))
+                            
+                            # 更新缓存
+                            self.last_sensor_data[sensor_id] = data
+                            self.last_publish_time[sensor_id] = time.time()
+                            
+                            # 根据是否变化记录不同的日志
+                            if data_changed:
+                                logging.info(f"📊 数据变化 - 发布到 {topic}: {data}")
+                            else:
+                                logging.info(f"💓 心跳发布 - 发布到 {topic}: {data}")
+                        else:
+                            logging.debug(f"⏭️  数据未变化，跳过发布: {sensor_id}")
+                            
+            time.sleep(self.config.get('polling_interval', 1))
 
     def _read_sensor(self, sensor_id, config):
         """读取单个传感器数据"""
@@ -144,6 +171,57 @@ class SensorMqttManager:
             logging.error(f"读取传感器 {sensor_id} 异常: {e}")
             self.modbus_client.close() # 发生异常时关闭连接，以便下次重连
             return None
+    
+    def _data_changed(self, sensor_id, new_data):
+        """判断传感器数据是否发生变化
+        
+        Args:
+            sensor_id: 传感器ID
+            new_data: 新读取的数据
+        
+        Returns:
+            bool: 数据是否变化
+        """
+        # 第一次读取，必须发布
+        if sensor_id not in self.last_sensor_data:
+            return True
+        
+        old_data = self.last_sensor_data[sensor_id]
+        
+        # 检查每个字段是否变化
+        for key in new_data:
+            old_val = old_data.get(key)
+            new_val = new_data.get(key)
+            
+            if old_val is None:
+                return True  # 新字段出现
+            
+            # 数值类型：使用阈值判断
+            if isinstance(new_val, (int, float)):
+                if abs(new_val - old_val) > self.change_threshold:
+                    return True
+            # 其他类型：直接比较
+            elif old_val != new_val:
+                return True
+        
+        return False
+    
+    def _should_force_publish(self, sensor_id):
+        """检查是否需要强制发布（心跳机制）
+        
+        Args:
+            sensor_id: 传感器ID
+        
+        Returns:
+            bool: 是否需要强制发布
+        """
+        # 第一次发布
+        if sensor_id not in self.last_publish_time:
+            return True
+        
+        # 检查距离上次发布的时间
+        elapsed = time.time() - self.last_publish_time[sensor_id]
+        return elapsed >= self.force_publish_interval
 
     def _parse_angle_data(self, registers):
         """解析角度传感器数据"""
