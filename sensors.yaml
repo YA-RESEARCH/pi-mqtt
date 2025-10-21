@@ -14,6 +14,11 @@ serial:
   bytesize: 8
   timeout: 1
 
+# 发布策略配置
+polling_interval: 1              # 轮询间隔(秒)，默认1秒
+force_publish_interval: 60       # 强制发布间隔(秒)，无论数据是否变化都会发布（心跳机制），默认60秒
+change_threshold: 0.1            # 数值变化阈值，小于此值的变化不触发发布，默认0.1
+
 sensors:
   angle_sensor_1:
     device_id: 80
